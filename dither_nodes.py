@@ -15,21 +15,31 @@ def process_channel(gray_img, params, as_rgba=False):
     else:
         processed = apply_halftone(adjusted, params['dot_size'], params['threshold'])
         
-    c1 = np.array(hex_to_rgb(params['color1']), dtype=np.uint8)
-    c2 = np.array(hex_to_rgb(params['color2']), dtype=np.uint8)
-    
     if as_rgba:
         # "channel color to alpha" - reversed mapping
-        # All pixels have RGB = color2 (channel color)
-        # Alpha is opaque where processed == 255 (background), transparent where processed == 0 (dots)
+        c = np.array(hex_to_rgb(params['color']), dtype=np.uint8)
         res = np.empty((nh, nw, 4), dtype=np.uint8)
-        res[..., :3] = c2
+        res[..., :3] = c
         res[..., 3] = processed
     else:
+        c1 = np.array(hex_to_rgb(params['color1']), dtype=np.uint8)
+        c2 = np.array(hex_to_rgb(params['color2']), dtype=np.uint8)
         res = np.empty((nh, nw, 3), dtype=np.uint8)
         mask = processed == 255
         res[mask] = c2
         res[~mask] = c1
+    return res
+
+def apply_background(rgba_img, bg_color_hex):
+    h, w, _ = rgba_img.shape
+    bg_rgb = np.array(hex_to_rgb(bg_color_hex), dtype=np.uint8)
+    c_src = rgba_img[..., :3].astype(np.float32) / 255.0
+    a_src = rgba_img[..., 3:4].astype(np.float32) / 255.0
+    c_bg = bg_rgb.astype(np.float32) / 255.0
+    res_rgb = c_src * a_src + c_bg * (1.0 - a_src)
+    res = np.empty((h, w, 4), dtype=np.uint8)
+    res[..., :3] = (res_rgb * 255.0).astype(np.uint8)
+    res[..., 3] = 255
     return res
 
 def blend_images(base, overlay, mode):
@@ -142,7 +152,7 @@ class DitherImage:
             
         return (torch.from_numpy(np.stack(output)),)
 
-def create_channel_inputs(prefix, default_color1="#000000", default_color2="#FFFFFF"):
+def create_channel_inputs(prefix, default_color="#000000"):
     return {
         f"{prefix}_method": (["atkinson", "halftone"],),
         f"{prefix}_threshold": ("FLOAT", {"default": 16.0, "min": 0.0, "max": 255.0, "step": 1.0}),
@@ -151,8 +161,7 @@ def create_channel_inputs(prefix, default_color1="#000000", default_color2="#FFF
         f"{prefix}_gamma": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 10.0, "step": 0.1}),
         f"{prefix}_grain": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0, "step": 1.0}),
         f"{prefix}_dot_size": ("INT", {"default": 6, "min": 1, "max": 100, "step": 1}),
-        f"{prefix}_color1": ("STRING", {"default": default_color1}),
-        f"{prefix}_color2": ("STRING", {"default": default_color2}),
+        f"{prefix}_color": ("STRING", {"default": default_color}),
         f"{prefix}_scale": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 10.0, "step": 0.1}),
     }
 
@@ -162,13 +171,14 @@ class DitherByChannel:
         inputs = {
             "image": ("IMAGE",),
             "color_space": (["RGB", "CMYK"],),
-            "blend_mode": (["multiply", "screen", "overlay", "add", "darken", "lighten"],)
+            "blend_mode": (["multiply", "screen", "overlay", "add", "darken", "lighten"],),
+            "bg_color": ("STRING", {"default": "#FFFFFF"}),
         }
         # Reasonable defaults for RGB or CMYK blending
-        inputs.update(create_channel_inputs("ch1", default_color1="#000000", default_color2="#FF0000"))
-        inputs.update(create_channel_inputs("ch2", default_color1="#000000", default_color2="#00FF00"))
-        inputs.update(create_channel_inputs("ch3", default_color1="#000000", default_color2="#0000FF"))
-        inputs.update(create_channel_inputs("ch4", default_color1="#000000", default_color2="#FFFFFF"))
+        inputs.update(create_channel_inputs("ch1", default_color="#FF0000"))
+        inputs.update(create_channel_inputs("ch2", default_color="#00FF00"))
+        inputs.update(create_channel_inputs("ch3", default_color="#0000FF"))
+        inputs.update(create_channel_inputs("ch4", default_color="#000000"))
         return {"required": inputs}
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE")
@@ -176,7 +186,7 @@ class DitherByChannel:
     FUNCTION = "process"
     CATEGORY = "image/dither"
 
-    def process(self, image, color_space, blend_mode, **kwargs):
+    def process(self, image, color_space, blend_mode, bg_color, **kwargs):
         b, h, w, c = image.shape
         
         out_ch1, out_ch2, out_ch3, out_ch4, out_overlay = [], [], [], [], []
@@ -205,8 +215,7 @@ class DitherByChannel:
                     'gamma': kwargs[f'{prefix}_gamma'],
                     'grain': kwargs[f'{prefix}_grain'],
                     'dot_size': kwargs[f'{prefix}_dot_size'],
-                    'color1': kwargs[f'{prefix}_color1'],
-                    'color2': kwargs[f'{prefix}_color2'],
+                    'color': kwargs[f'{prefix}_color'],
                     'scale': kwargs[f'{prefix}_scale']
                 }
                 
@@ -234,14 +243,26 @@ class DitherByChannel:
                     resized = ch_img
                 resized_channels.append(resized)
                 
-            merged = resized_channels[0]
-            for idx in range(1, len(resized_channels)):
+            # Initialize with the solid background color
+            bg_rgb = np.array(hex_to_rgb(bg_color), dtype=np.uint8)
+            base_bg = np.empty((max_h, max_w, 4), dtype=np.uint8)
+            base_bg[..., :3] = bg_rgb
+            base_bg[..., 3] = 255
+            
+            merged = base_bg
+            for idx in range(len(resized_channels)):
                 merged = blend_images(merged, resized_channels[idx], blend_mode)
                 
-            out_ch1.append(res1.astype(np.float32) / 255.0)
-            out_ch2.append(res2.astype(np.float32) / 255.0)
-            out_ch3.append(res3.astype(np.float32) / 255.0)
-            out_ch4.append(res4.astype(np.float32) / 255.0)
+            # Apply the solid unified background color to each individual channel output
+            flat_ch1 = apply_background(res1, bg_color)
+            flat_ch2 = apply_background(res2, bg_color)
+            flat_ch3 = apply_background(res3, bg_color)
+            flat_ch4 = apply_background(res4, bg_color)
+            
+            out_ch1.append(flat_ch1.astype(np.float32) / 255.0)
+            out_ch2.append(flat_ch2.astype(np.float32) / 255.0)
+            out_ch3.append(flat_ch3.astype(np.float32) / 255.0)
+            out_ch4.append(flat_ch4.astype(np.float32) / 255.0)
             out_overlay.append(merged.astype(np.float32) / 255.0)
             
         return (
