@@ -3,7 +3,7 @@ import numpy as np
 import cv2
 from .dither_utils import apply_adjustments, apply_atkinson_core, apply_halftone, hex_to_rgb
 
-def process_channel(gray_img, params):
+def process_channel(gray_img, params, as_rgba=False):
     nh, nw = int(gray_img.shape[0] * params['scale']), int(gray_img.shape[1] * params['scale'])
     if params['scale'] != 1.0:
         gray_img = cv2.resize(gray_img, (nw, nh), interpolation=cv2.INTER_AREA)
@@ -18,34 +18,56 @@ def process_channel(gray_img, params):
     c1 = np.array(hex_to_rgb(params['color1']), dtype=np.uint8)
     c2 = np.array(hex_to_rgb(params['color2']), dtype=np.uint8)
     
-    res = np.empty((nh, nw, 3), dtype=np.uint8)
-    mask = processed == 255
-    res[mask] = c2
-    res[~mask] = c1
+    if as_rgba:
+        # "channel color to alpha"
+        # All pixels have RGB = color2 (channel color)
+        # Alpha is opaque where processed == 0 (dots), transparent where processed == 255 (background)
+        res = np.empty((nh, nw, 4), dtype=np.uint8)
+        res[..., :3] = c2
+        res[..., 3] = 255 - processed
+    else:
+        res = np.empty((nh, nw, 3), dtype=np.uint8)
+        mask = processed == 255
+        res[mask] = c2
+        res[~mask] = c1
     return res
 
 def blend_images(base, overlay, mode):
+    # Perform alpha blending with Porter-Duff compositing and standard blend modes
     base = base.astype(np.float32) / 255.0
     overlay = overlay.astype(np.float32) / 255.0
     
+    c_dst, a_dst = base[..., :3], base[..., 3:4]
+    c_src, a_src = overlay[..., :3], overlay[..., 3:4]
+    
     if mode == "multiply":
-        res = base * overlay
+        f = c_dst * c_src
     elif mode == "screen":
-        res = 1.0 - (1.0 - base) * (1.0 - overlay)
+        f = 1.0 - (1.0 - c_dst) * (1.0 - c_src)
     elif mode == "overlay":
-        mask = base < 0.5
-        res = np.zeros_like(base)
-        res[mask] = 2.0 * base[mask] * overlay[mask]
-        res[~mask] = 1.0 - 2.0 * (1.0 - base[~mask]) * (1.0 - overlay[~mask])
+        mask = c_dst < 0.5
+        f = np.zeros_like(c_dst)
+        f[mask] = 2.0 * c_dst[mask] * c_src[mask]
+        f[~mask] = 1.0 - 2.0 * (1.0 - c_dst[~mask]) * (1.0 - c_src[~mask])
     elif mode == "add":
-        res = np.clip(base + overlay, 0.0, 1.0)
+        f = np.clip(c_dst + c_src, 0.0, 1.0)
     elif mode == "darken":
-        res = np.minimum(base, overlay)
+        f = np.minimum(c_dst, c_src)
     elif mode == "lighten":
-        res = np.maximum(base, overlay)
+        f = np.maximum(c_dst, c_src)
     else:
-        res = overlay
+        f = c_src
         
+    a_res = a_src + a_dst * (1.0 - a_src)
+    safe_a_res = np.where(a_res > 0.0, a_res, 1.0)
+    
+    c_res = (c_src * a_src * (1.0 - a_dst) + 
+             c_dst * a_dst * (1.0 - a_src) + 
+             a_src * a_dst * f) / safe_a_res
+             
+    res = np.empty_like(base)
+    res[..., :3] = c_res
+    res[..., 3:4] = a_res
     return (res * 255.0).astype(np.uint8)
 
 def extract_rgb(img):
@@ -188,14 +210,14 @@ class DitherByChannel:
                     'scale': kwargs[f'{prefix}_scale']
                 }
                 
-            res1 = process_channel(ch1, params[0])
-            res2 = process_channel(ch2, params[1])
-            res3 = process_channel(ch3, params[2])
+            res1 = process_channel(ch1, params[0], as_rgba=True)
+            res2 = process_channel(ch2, params[1], as_rgba=True)
+            res3 = process_channel(ch3, params[2], as_rgba=True)
             
             if ch4 is not None:
-                res4 = process_channel(ch4, params[3])
+                res4 = process_channel(ch4, params[3], as_rgba=True)
             else:
-                res4 = np.zeros((res1.shape[0], res1.shape[1], 3), dtype=np.uint8)
+                res4 = np.zeros((res1.shape[0], res1.shape[1], 4), dtype=np.uint8)
                 
             channels = [res1, res2, res3]
             if ch4 is not None:
