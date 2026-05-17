@@ -19,12 +19,12 @@ def process_channel(gray_img, params, as_rgba=False):
     c2 = np.array(hex_to_rgb(params['color2']), dtype=np.uint8)
     
     if as_rgba:
-        # "channel color to alpha"
+        # "channel color to alpha" - reversed mapping
         # All pixels have RGB = color2 (channel color)
-        # Alpha is opaque where processed == 0 (dots), transparent where processed == 255 (background)
+        # Alpha is opaque where processed == 255 (background), transparent where processed == 0 (dots)
         res = np.empty((nh, nw, 4), dtype=np.uint8)
         res[..., :3] = c2
-        res[..., 3] = 255 - processed
+        res[..., 3] = processed
     else:
         res = np.empty((nh, nw, 3), dtype=np.uint8)
         mask = processed == 255
